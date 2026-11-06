@@ -142,4 +142,90 @@ class BNN(nn.Module):
         return self.layers[-1](values)
 
 model = BNN()
-print("Output shape:", model(inputs[:8]).shape)
+#print("Output shape:", model(inputs[:8]).shape)
+
+@torch.no_grad()
+def evaluate(model, evaluation_inputs, evaluation_labels):
+    model.eval()
+
+    predictions = model(evaluation_inputs) >= 0
+    expected = evaluation_labels.bool()
+
+    accuracy = (
+        predictions == expected
+    ).float().mean().item()
+
+    dangerous_errors = (
+        expected & ~predictions
+    ).sum().item()
+
+    required_braking = expected.sum().item()
+
+    missed_braking_rate = (
+        dangerous_errors / max(required_braking, 1)
+    )
+
+    return {
+        "accuracy": accuracy,
+        "dangerous_errors": dangerous_errors,
+        "missed_braking_rate": missed_braking_rate,
+    }
+
+
+model = BNN(hidden_sizes=(32, 16))
+
+loader = DataLoader(
+    train_dataset,
+    batch_size=256,
+    shuffle=True,
+    generator=torch.Generator().manual_seed(SEED),
+)
+
+optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
+loss_function = nn.BCEWithLogitsLoss()
+
+best_validation_accuracy = -1.0
+best_state = copy.deepcopy(model.state_dict())
+
+for epoch in range(1, 101):
+    model.train()
+    total_loss = 0.0
+
+    for batch_inputs, batch_labels in loader:
+        optimizer.zero_grad()
+
+        scores = model(batch_inputs)
+        loss = loss_function(scores, batch_labels)
+
+        loss.backward()
+        optimizer.step()
+
+        with torch.no_grad():
+            for layer in model.layers:
+                layer.weight.clamp_(-1, 1)
+
+        total_loss += loss.item() * len(batch_inputs)
+
+    validation_metrics = evaluate(
+        model,
+        validation_inputs,
+        validation_labels,
+    )
+
+    if validation_metrics["accuracy"] > best_validation_accuracy:
+        best_validation_accuracy = validation_metrics["accuracy"]
+        best_state = copy.deepcopy(model.state_dict())
+
+    if epoch == 1 or epoch % 10 == 0:
+        average_loss = total_loss / len(train_dataset)
+
+        print(
+            f"Epoch {epoch:3d} | "
+            f"loss={average_loss:.4f} | "
+            f"validation={validation_metrics}"
+        )
+
+model.load_state_dict(best_state)
+
+test_metrics = evaluate(model, test_inputs, test_labels)
+print("Final test results:", test_metrics)
