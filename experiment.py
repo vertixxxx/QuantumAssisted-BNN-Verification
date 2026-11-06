@@ -229,3 +229,49 @@ model.load_state_dict(best_state)
 
 test_metrics = evaluate(model, test_inputs, test_labels)
 print("Final test results:", test_metrics)
+
+output_directory = Path("artifacts")
+output_directory.mkdir(exist_ok=True)
+
+exported_layers = []
+
+for layer in model.layers:
+    exported_layers.append({
+        "weights": binary_value(
+            layer.weight.detach()
+        ).to(torch.int64).tolist(),
+
+        "biases": layer.bias.detach().round().to(
+            torch.int64
+        ).tolist(),
+    })
+
+exported_model = {
+    "seed": SEED,
+    "input_encoding": "least significant bit first; 0 -> -1, 1 -> +1",
+    "sensor_order": ["front", "left", "right", "speed", "wet"],
+    "sensor_bit_widths": [5, 5, 5, 4, 1],
+    "hidden_activation": "sum >= 0 -> +1; otherwise -1",
+    "output_decision": "sum >= 0 -> brake; otherwise continue",
+    "layers": exported_layers,
+    "test_metrics": test_metrics,
+}
+
+with (output_directory / "bnn.json").open(
+    "w", encoding="utf-8"
+) as file:
+    json.dump(exported_model, file, indent=2)
+
+np.savez(
+    output_directory / "dataset_split.npz",
+    train_ids=identifiers[:train_end],
+    validation_ids=identifiers[train_end:validation_end],
+    test_ids=identifiers[validation_end:],
+)
+
+torch.save(
+    model.state_dict(),
+    output_directory / "training_weights.pt",
+)
+
+print("Saved model and dataset split.")
