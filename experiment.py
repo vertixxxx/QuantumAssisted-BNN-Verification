@@ -141,7 +141,7 @@ class BNN(nn.Module):
         # Scorul final este folosit la calcularea pierderii.
         return self.layers[-1](values)
 
-model = BNN()
+
 #print("Output shape:", model(inputs[:8]).shape)
 
 @torch.no_grad()
@@ -172,106 +172,179 @@ def evaluate(model, evaluation_inputs, evaluation_labels):
     }
 
 
-model = BNN(hidden_sizes=(32, 16))
 
-loader = DataLoader(
-    train_dataset,
-    batch_size=256,
-    shuffle=True,
-    generator=torch.Generator().manual_seed(SEED),
-)
-
-optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
-loss_function = nn.BCEWithLogitsLoss()
-
-best_validation_accuracy = -1.0
-best_state = copy.deepcopy(model.state_dict())
-
-for epoch in range(1, 101):
-    model.train()
-    total_loss = 0.0
-
-    for batch_inputs, batch_labels in loader:
-        optimizer.zero_grad()
-
-        scores = model(batch_inputs)
-        loss = loss_function(scores, batch_labels)
-
-        loss.backward()
-        optimizer.step()
-
-        with torch.no_grad():
-            for layer in model.layers:
-                layer.weight.clamp_(-1, 1)
-
-        total_loss += loss.item() * len(batch_inputs)
-
-    validation_metrics = evaluate(
-        model,
-        validation_inputs,
-        validation_labels,
-    )
-
-    if validation_metrics["accuracy"] > best_validation_accuracy:
-        best_validation_accuracy = validation_metrics["accuracy"]
-        best_state = copy.deepcopy(model.state_dict())
-
-    if epoch == 1 or epoch % 10 == 0:
-        average_loss = total_loss / len(train_dataset)
-
-        print(
-            f"Epoch {epoch:3d} | "
-            f"loss={average_loss:.4f} | "
-            f"validation={validation_metrics}"
-        )
-
-model.load_state_dict(best_state)
-
-test_metrics = evaluate(model, test_inputs, test_labels)
-print("Final test results:", test_metrics)
-
-output_directory = Path("artifacts")
-output_directory.mkdir(exist_ok=True)
-
-exported_layers = []
-
-for layer in model.layers:
-    exported_layers.append({
-        "weights": binary_value(
-            layer.weight.detach()
-        ).to(torch.int64).tolist(),
-
-        "biases": layer.bias.detach().round().to(
-            torch.int64
-        ).tolist(),
-    })
-
-exported_model = {
-    "seed": SEED,
-    "input_encoding": "least significant bit first; 0 -> -1, 1 -> +1",
-    "sensor_order": ["front", "left", "right", "speed", "wet"],
-    "sensor_bit_widths": [5, 5, 5, 4, 1],
-    "hidden_activation": "sum >= 0 -> +1; otherwise -1",
-    "output_decision": "sum >= 0 -> brake; otherwise continue",
-    "layers": exported_layers,
-    "test_metrics": test_metrics,
+ARCHITECTURES = {
+    "small": (8,),
+    "medium": (16, 8),
+    "initial": (32, 16),
+    "large": (64, 32),
 }
 
-with (output_directory / "bnn.json").open(
-    "w", encoding="utf-8"
-) as file:
-    json.dump(exported_model, file, indent=2)
+EPOCHS = 100
 
+# Folderul artifacts va fi creat lângă experiment.py.
+output_root = Path(__file__).resolve().parent / "artifacts"
+output_root.mkdir(exist_ok=True)
+
+# Toate arhitecturile folosesc exact aceleași date.
 np.savez(
-    output_directory / "dataset_split.npz",
+    output_root / "dataset_split.npz",
     train_ids=identifiers[:train_end],
     validation_ids=identifiers[train_end:validation_end],
     test_ids=identifiers[validation_end:],
 )
 
-torch.save(
-    model.state_dict(),
-    output_directory / "training_weights.pt",
-)
+all_results = []
 
-print("Saved model and dataset split.")
+for name, hidden_sizes in ARCHITECTURES.items():
+    print(f"\nTraining architecture: {name}")
+    print(f"Layers: {[BIT_COUNT, *hidden_sizes, 1]}")
+
+    # Resetăm seed-ul înainte de crearea fiecărui model.
+    torch.manual_seed(SEED)
+
+    model = BNN(hidden_sizes=hidden_sizes)
+
+    # Resetăm și generatorul pentru ordinea exemplelor.
+    loader = DataLoader(
+        train_dataset,
+        batch_size=256,
+        shuffle=True,
+        generator=torch.Generator().manual_seed(SEED),
+    )
+
+    # Fiecare model primește un optimizator nou.
+    optimizer = torch.optim.Adam(
+        model.parameters(),
+        lr=0.001,
+    )
+    loss_function = nn.BCEWithLogitsLoss()
+
+    best_validation_accuracy = -1.0
+    best_epoch = 0
+    best_state = copy.deepcopy(model.state_dict())
+
+    for epoch in range(1, EPOCHS + 1):
+        model.train()
+        total_loss = 0.0
+
+        for batch_inputs, batch_labels in loader:
+            optimizer.zero_grad()
+
+            scores = model(batch_inputs)
+            loss = loss_function(scores, batch_labels)
+
+            loss.backward()
+            optimizer.step()
+
+            with torch.no_grad():
+                for layer in model.layers:
+                    layer.weight.clamp_(-1, 1)
+
+            total_loss += loss.item() * len(batch_inputs)
+
+        validation_metrics = evaluate(
+            model,
+            validation_inputs,
+            validation_labels,
+        )
+
+        if validation_metrics["accuracy"] > best_validation_accuracy:
+            best_validation_accuracy = validation_metrics["accuracy"]
+            best_epoch = epoch
+            best_state = copy.deepcopy(model.state_dict())
+
+        if epoch == 1 or epoch % 10 == 0:
+            average_loss = total_loss / len(train_dataset)
+
+            print(
+                f"[{name}] Epoch {epoch:3d} | "
+                f"loss={average_loss:.4f} | "
+                f"validation={validation_metrics}"
+            )
+
+    # Recuperăm versiunea aleasă pe baza validării.
+    model.load_state_dict(best_state)
+
+    # Evaluăm această versiune pe setul de test.
+    test_metrics = evaluate(
+        model,
+        test_inputs,
+        test_labels,
+    )
+
+    print(f"[{name}] Best epoch: {best_epoch}")
+    print(f"[{name}] Test results: {test_metrics}")
+
+    # Fiecare arhitectură are propriul folder.
+    model_directory = output_root / name
+    model_directory.mkdir(exist_ok=True)
+
+    exported_layers = []
+
+    for layer in model.layers:
+        exported_layers.append({
+            "weights": binary_value(
+                layer.weight.detach()
+            ).to(torch.int64).tolist(),
+
+            "biases": layer.bias.detach().round().to(
+                torch.int64
+            ).tolist(),
+        })
+
+    exported_model = {
+        "name": name,
+        "seed": SEED,
+        "architecture": [BIT_COUNT, *hidden_sizes, 1],
+        "input_encoding": (
+            "least significant bit first; 0 -> -1, 1 -> +1"
+        ),
+        "sensor_order": [
+            "front", "left", "right", "speed", "wet"
+        ],
+        "sensor_bit_widths": [5, 5, 5, 4, 1],
+        "hidden_activation": "sum >= 0 -> +1; otherwise -1",
+        "output_decision": "sum >= 0 -> brake; otherwise continue",
+        "best_epoch": best_epoch,
+        "best_validation_accuracy": best_validation_accuracy,
+        "layers": exported_layers,
+        "test_metrics": test_metrics,
+    }
+
+    with (model_directory / "bnn.json").open(
+        "w", encoding="utf-8"
+    ) as file:
+        json.dump(exported_model, file, indent=2)
+
+    torch.save(
+        model.state_dict(),
+        model_directory / "training_weights.pt",
+    )
+
+    all_results.append({
+        "name": name,
+        "architecture": [BIT_COUNT, *hidden_sizes, 1],
+        "best_epoch": best_epoch,
+        "validation_accuracy": best_validation_accuracy,
+        **test_metrics,
+    })
+
+    # Salvăm progresul după fiecare model terminat.
+    with (output_root / "comparison.json").open(
+        "w", encoding="utf-8"
+    ) as file:
+        json.dump(all_results, file, indent=2)
+
+    print(f"Saved to: {model_directory}")
+
+
+print("\nFinal comparison")
+
+for result in all_results:
+    print(
+        f"{result['name']:8s} | "
+        f"test accuracy={result['accuracy']:.2%} | "
+        f"dangerous errors={result['dangerous_errors']} | "
+        f"missed braking={result['missed_braking_rate']:.2%}"
+    )
